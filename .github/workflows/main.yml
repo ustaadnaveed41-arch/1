@@ -1,0 +1,159 @@
+name: Windows RDP via Tailscale (B)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ts_tailnet:
+        description: "Tailscale tailnet (e.g. you@gmail.com)"
+        required: true
+      ts_api_key:
+        description: "Tailscale API key (device admin, no 'Bearer')"
+        required: true
+      ts_authkey:
+        description: "Tailscale auth key (reusable or ephemeral)"
+        required: true
+      gh_api_token:
+        description: "GitHub Personal Access Token (classic; scopes: repo, workflow)"
+        required: true
+      test_mode:
+        description: "Run 5-minute test loop"
+        type: boolean
+        default: false
+      runtime_minutes:
+        description: "Runtime in minutes (max 360; capped to 355)"
+        default: "355"
+      loops:
+        description: "How many handoffs (0 = infinite)"
+        default: "0"
+
+  workflow_run:
+    workflows: ["Windows RDP via Tailscale (A)"]
+    types: [completed]
+
+concurrency:
+  group: tailscale-rdp-singleton
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  RDP_USER: Bullettemporary
+  RDP_PASS: Bullet@12345
+  TS_HOSTNAME: bullet
+
+jobs:
+  rdp:
+    runs-on: windows-2022
+    timeout-minutes: 370
+
+    steps:
+      - name: Resolve inputs
+        id: cfg
+        run: |
+          function ToIntOr($v,$d){ if("$v" -match '^\d+$'){[int]$v}else{[int]$d} }
+
+          $tailnet="${{ inputs.ts_tailnet }}"
+          $apikey="${{ inputs.ts_api_key }}"
+          $authkey="${{ inputs.ts_authkey }}"
+          $pat="${{ inputs.gh_api_token }}"
+
+          if(!$tailnet -or !$apikey -or !$authkey -or !$pat){
+            Write-Error "Missing required inputs"
+            exit 1
+          }
+
+          $runtime=ToIntOr "${{ inputs.runtime_minutes }}" 355
+          if("${{ inputs.test_mode }}" -eq "true"){ $runtime=5 }
+          if($runtime -gt 360){ $runtime=355 }
+
+          $loops=ToIntOr "${{ inputs.loops }}" 0
+          if($loops -lt 0){ $loops=0 }
+
+          "tailnet=$tailnet" >> $env:GITHUB_OUTPUT
+          "apikey=$apikey" >> $env:GITHUB_OUTPUT
+          "authkey=$authkey" >> $env:GITHUB_OUTPUT
+          "pat=$pat" >> $env:GITHUB_OUTPUT
+          "runtime=$runtime" >> $env:GITHUB_OUTPUT
+          "loops=$loops" >> $env:GITHUB_OUTPUT
+
+      - name: Install Tailscale
+        run: |
+          $exe="C:\Program Files\Tailscale\tailscale.exe"
+          if(!(Test-Path $exe)){
+            Invoke-WebRequest https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe `
+              -OutFile $env:TEMP\tailscale.exe
+            Start-Process $env:TEMP\tailscale.exe -ArgumentList "/quiet" -Wait
+          }
+          Start-Service Tailscale
+          & $exe version
+
+      - name: Enable RDP
+        run: |
+          $u="${{ env.RDP_USER }}"
+          $p="${{ env.RDP_PASS }}"
+          $sec=ConvertTo-SecureString $p -AsPlainText -Force
+
+          if(!(Get-LocalUser -Name $u -ErrorAction SilentlyContinue)){
+            New-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Add-LocalGroupMember Administrators $u
+            Add-LocalGroupMember "Remote Desktop Users" $u
+          }
+
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+      - name: Tailscale up
+        id: up
+        run: |
+          $ts="C:\Program Files\Tailscale\tailscale.exe"
+          & $ts logout | Out-Null
+          & $ts up --authkey "${{ steps.cfg.outputs.authkey }}" `
+                  --hostname "${{ env.TS_HOSTNAME }}" `
+                  --accept-routes --accept-dns=false
+
+          Start-Sleep 3
+          $ip4=& $ts ip -4 | Select-Object -First 1
+          "ip4=$ip4" >> $env:GITHUB_OUTPUT
+
+      - name: Keep alive
+        run: |
+          $end=(Get-Date).AddMinutes([int]"${{ steps.cfg.outputs.runtime }}")
+          while((Get-Date) -lt $end){
+            Write-Host "RDP alive..."
+            Start-Sleep 60
+          }
+
+      - name: Dispatch workflow A
+        if: always()
+        run: |
+          $loops=[int]"${{ steps.cfg.outputs.loops }}"
+          if($loops -eq 1){ exit 0 }
+          if($loops -gt 1){ $next=$loops-1 } else { $next=0 }
+
+          $token="${{ steps.cfg.outputs.pat }}"
+
+          $body=@{
+            ref="${{ github.ref_name }}"
+            inputs=@{
+              ts_tailnet="${{ steps.cfg.outputs.tailnet }}"
+              ts_api_key="${{ steps.cfg.outputs.apikey }}"
+              ts_authkey="${{ steps.cfg.outputs.authkey }}"
+              gh_api_token="$token"
+              test_mode="false"
+              runtime_minutes="${{ steps.cfg.outputs.runtime }}"
+              loops="$next"
+            }
+          } | ConvertTo-Json -Depth 5
+
+          Invoke-RestMethod `
+            -Method POST `
+            -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/windows-rdp-tailscale-A.yml/dispatches" `
+            -Headers @{Authorization="Bearer $token";Accept="application/vnd.github+json"} `
+            -Body $body
